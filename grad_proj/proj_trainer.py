@@ -702,7 +702,6 @@ class ProjTrainer(Trainer):
         # 1. get all losses and task ids from all ranks
         task_ids: torch.Tensor = outputs.this_task_ids
         raw_loss: torch.Tensor = outputs.loss
-        print("#"*4, task_ids)
         # exit(0)
         raw_loss = raw_loss.reshape(self._train_batch_size, -1)
         mask = (raw_loss > 0)

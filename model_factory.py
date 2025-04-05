@@ -193,6 +193,38 @@ def create_partial_model(model_args: ModelArguments, training_args: TrainingArgu
     model.language_model.lm_head.requires_grad_(True)
     return tokenizer, model
 
+def create_full_model(model_args: ModelArguments, training_args: TrainingArguments) -> tuple[PreTrainedTokenizer, PreTrainedModel]:
+    """Stage 2 model
+    
+    - 🔥 mm_projector
+    - 🔥 LoRA
+    - 🥶 graph tower
+    - 🥶 LLM
+
+    Args:
+        model_args (ModelArguments): Model arguments
+        training_args (TrainingArguments): Training arguments
+
+    Returns:
+        tuple[PreTrainedTokenizer, PreTrainedModel]: tokenizer for the specific model and the model itself
+    """
+
+    # 2. Instantiate tokenizer, model
+    tokenizer = AutoTokenizer.from_pretrained(model_args.base_model)
+
+    model = GraphLlavaForConditionalGeneration.from_pretrained(model_args.base_model)   
+
+    training_args.lora_enable = True
+
+    model.requires_grad_(False)
+
+    # 5. set parameters, since LoRA freeze all parameters, we activate projector here
+    model.mm_projector.requires_grad_(True)
+    for name,param in model.named_parameters():
+        if 'lora_' in name:
+            param.requires_grad = True
+        
+    return tokenizer, model
 
 def create_lora_model(model_args: ModelArguments, training_args: TrainingArguments) -> tuple[PreTrainedTokenizer, PreTrainedModel]:
     """Stage 2 model
@@ -617,13 +649,55 @@ def load_partial_model(
     model.load_state_dict(trainables, strict=False)
         
     return tokenizer, model
+
+def load_lora_model_sequential(
+    model_args: ModelArguments, training_args: TrainingArguments
+):
+    # 1. Build base language model
+    config = GraphLlavaConfig.from_pretrained(model_args.model_name_or_path)
+
+    with no_init_weights():
+        model = GraphLlavaForConditionalGeneration(config)
+        
+    tokenizer = AutoTokenizer.from_pretrained(model_args.base_model)
+    model.load_language_model()
+    model.load_graph(model_args.graph_init_checkpoint)
+    
+    # 3. Load MoE and projctor weights
+    logger.info('Loading additional LLaVA weights...')
+    if os.path.exists(os.path.join(model_args.model_name_or_path, 'non_lora_trainables.bin')):
+        non_lora_trainables = torch.load(
+            os.path.join(model_args.model_name_or_path, 'non_lora_trainables.bin'), map_location='cpu')
+        logger.info(f"Non-lora trainables: {non_lora_trainables.keys()}", on_rank0=True)
+    else:
+        logger.info("No Non-lora weights detected!")
+        raise NotImplementedError
+    non_lora_state_dict = {k.split("base_model.model.")[1]: v for k, v in non_lora_trainables.items()}
+    
+    model.load_state_dict(non_lora_state_dict, strict=False)
+    
+    # 4. load and merge lora
+    from peft import PeftModel
+    logger.info('Loading LoRA weights...')
+    model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
+    torch.cuda.empty_cache()
+    training_args.lora_enable = True
+    for name, param in model.named_parameters():
+        if any(keyword in name.lower() for keyword in ['mm_projector','lora']):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False  # 可选：其余参数显式冻结
+    model.enable_input_require_grads()  
+    return tokenizer, model
     
 MODEL_STAGE_MAP = {
     "stage1": create_stage1_model,
     "partial":create_partial_model,
     "lora": create_lora_model,
+    "full":create_full_model,
     "moe+lora": create_moe_lora_model,
-    "sequential": load_moe_lora_model_sequential
+    "sequential": load_moe_lora_model_sequential,
+    "lora_sequential":load_lora_model_sequential
 }
 
 def create_model(
