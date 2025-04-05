@@ -22,7 +22,7 @@ from packaging import version
 from torch import nn
 from torch.utils.data import RandomSampler
 
-from . import __version__
+from transformers import __version__
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
 from transformers.integrations.tpu import tpu_spmd_dataloader
@@ -59,6 +59,18 @@ from transformers.utils import (
     is_torch_xpu_available,
     logging,
 )
+
+from transformers import Trainer
+import torch
+import os
+from transformers.trainer import get_parameter_names, ALL_LAYERNORM_LAYERS
+from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
+from transformers.utils import is_peft_available, is_datasets_available
+import importlib
+from packaging import version
+import numpy as np
+from typing import Optional
+from helpers import maybe_zero_3
 
 from typing import Dict, Union, Any
 
@@ -99,10 +111,6 @@ if is_sagemaker_mp_enabled():
 else:
     IS_SAGEMAKER_MP_POST_1_10 = False
 
-from transformers.models.auto.modeling_auto import (
-    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
-    MODEL_MAPPING_NAMES,
-)
 
 if is_safetensors_available():
     import safetensors.torch
@@ -147,6 +155,11 @@ def _is_peft_model(model):
             classes_to_check = (*classes_to_check, PeftMixedModel)
         return isinstance(model, classes_to_check)
     return False
+
+def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
+    to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
 
 if TYPE_CHECKING:
     import optuna
@@ -689,33 +702,22 @@ class ProjTrainer(Trainer):
         # 1. get all losses and task ids from all ranks
         task_ids: torch.Tensor = outputs.this_task_ids
         raw_loss: torch.Tensor = outputs.loss
-        
-        all_losses = [torch.zeros_like(raw_loss) for _ in range(dist.get_world_size())]
-        all_losses = dist.all_gather(all_losses, raw_loss)
-        
-        all_task_ids = [torch.zeros_like(task_ids) for _ in range(dist.get_world_size)]
-        all_task_ids = dist.all_gather(all_task_ids, task_ids)
-        
-        print("&"*100, all_losses)
-        print("^"*100, all_task_ids)
-        
+        print("#"*4, task_ids)
+        # exit(0)
+        raw_loss = raw_loss.reshape(self._train_batch_size, -1)
+        mask = (raw_loss > 0)
+        raw_loss = raw_loss.sum(1) / mask.sum(1)
+        # print(raw_loss)
+        # exit(0)
         # 2. reduce relavent losses
-        unique_task_ids = set([ele.item() for task in all_task_ids for ele in task])
+        unique_task_ids = set([ele.item() for ele in task_ids])
         
-        # rank x B
-        all_losses = torch.stack(all_losses, dim=0)
-        all_task_ids = torch.stack(all_task_ids, dim=0)
-        
-        loss_dict = {}
+        loss_dict = {}  # task_id: loss
         for t_id in unique_task_ids:
-            indices = torch.where(all_task_ids == t_id)
-            losses = all_losses[indices[0], indices[1]]
+            indices = torch.where(task_ids == t_id)
+            losses = raw_loss[indices[0]]
             loss_dict[str(t_id)] = losses
-            
-        print("@"*100, loss_dict)
-        
-        exit(0)
-            
+           
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         # if self.args.past_index >= 0:
@@ -800,38 +802,60 @@ class ProjTrainer(Trainer):
         
         # here, loss is a dict{task_id: loss}
         # 1. gradient collection
-        grads = {k: defaultdict(list) for k, v in model.named_parameters()}
+        grads = {k: defaultdict(list) for k, v in model.named_parameters() if v.requires_grad}
         for t_id, l in loss.items():
-            # since we have exactly the same loss on each rank, all reduce will yield 
-            # the same result as we backward on a single rank.
             for sub_l in l:  # single gradient for each task
-                self.accelerator.backward(sub_l, **kwargs)
-                for name, param in model.named_parameters():
-                    grads[name][t_id].append(param.grad)
-                model.zero_grad()
+                # self.accelerator.backward(sub_l, retain_graph=True, **kwargs)
+                # print("$"*100, sub_l)
+                # exit(0)
+                grads_for_loss = torch.autograd.grad(sub_l, [param for param in model.parameters() if param.requires_grad], retain_graph=True)
+                required_state_dict = {k: v for k, v in model.named_parameters() if v.requires_grad}
+                for (name, param), grad in zip(required_state_dict.items(), grads_for_loss):
+                    if (name in grads.keys()) and grad is not None:
+                        grads[name][t_id].append(grad.clone().detach())
+                # model.zero_grad()
+                
+        # print("^"*100, grads.keys())
+        # exit(0)
+                
+        # print("&"*100, [ele for ele in grads.values()][0])
+        # exit(0)
                 
         # resulting structure:
         # {
-        #    param_name: {
+        #    layers.21.lora.A: {
         #        t_id: list[gradient]
         #     }
-        # }
+        #    layers.21.lora.B: {
+        #        t_id: list[gradient]
+        #     }
+        # }  64 x 2048
         
         # 2. calculate the projection
         grad_dict = {}
         for name, id2grad in grads.items():
             # a. calculate the mean
+            # print(name*10, id2grad)
             mean_grad = torch.mean(torch.stack([torch.mean(torch.stack(grad,dim=0), dim=0) for grad in id2grad.values()], dim=0), dim=0)
             # b. project to mean
             for t_id, grad in id2grad.items():
+                # print("#"*100, grad)
                 id2grad[t_id] = [project_to_mean(g, mean_grad) for g in grad]
+                # print("&"*100, id2grad[t_id])
+                
+                # exit(0)
                 
             # c. mean grad
             grad_dict[name] = torch.mean(torch.stack([grad for all_grad in id2grad.values() for grad in all_grad],dim=0),dim=0)
             
+        # manually all reduce here
+        for name, grad in grad_dict.items():
+            dist.all_reduce(grad, op=dist.ReduceOp.AVG)
+            
         # 3. apply to the model gradient dict
         for name, param in model.named_parameters():
-            param.grad.copy_(grad_dict[name])
+            if name in grad_dict.keys():
+                param.grad = grad_dict[name]
             
         loss = torch.cat([l for l in loss.values()], dim=0).mean()
 
@@ -846,10 +870,275 @@ class ProjTrainer(Trainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
     
+    def create_optimizer(self):
+        opt_model = self.model
+
+        if self.optimizer is not None:
+            return self.optimizer
+
+        # Separate decay parameters, excluding bias and layernorms
+        decay_parameters = [
+            n for n in get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
+            if "bias" not in n
+        ]
+        
+        # Group parameters for weight decay and no decay
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p for n, p in opt_model.named_parameters()
+                    if n in decay_parameters and p.requires_grad
+                ],
+                "weight_decay": self.args.weight_decay,
+                "name": "decay_parameters"
+            },
+            {
+                "params": [
+                    p for n, p in opt_model.named_parameters()
+                    if n not in decay_parameters and p.requires_grad
+                ],
+                "weight_decay": 0.0,
+                "name": "no_decay_parameters"
+            },
+        ]
+        
+        # Log MoE parameters
+        for name, param in opt_model.named_parameters():
+            if is_moe_param(param):
+                logger.info(f"Detected MoE parameters: {name}", on_rank0=True)
+
+        if self.args.moe_enable:
+            logger.info(f"Splitting params for MoE...", on_rank0=True)
+            optimizer_grouped_parameters = split_params_into_different_moe_groups_for_optimizer(
+                optimizer_grouped_parameters
+            )
+
+        # Get optimizer class and arguments
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return self.optimizer
+    
+    # NOTE: Updataed, test whether this can save optimizer steps
+    def _save_checkpoint(self, model, trial, metrics=None):
+        if getattr(self.args, 'training_recipe') == "stage1":
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            from transformers.trainer import TRAINER_STATE_NAME
+            # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+            # want to save except FullyShardedDDP.
+            # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+            # Save model checkpoint
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+            if self.hp_search_backend is None and trial is None:
+                self.store_flos()
+
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            # Only save Adapter ==============
+            keys_to_match = ['mm_projector']
+            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+
+            if self.args.local_rank == 0 or self.args.local_rank == -1:
+                self.model.config.save_pretrained(output_dir)
+                torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+            # self.save_model(output_dir, _internal_call=True)
+            #===================================
+
+            if not self.args.save_only_model:
+                # Save optimizer and scheduler
+                self._save_optimizer_and_scheduler(output_dir)
+                # Save RNG state
+                self._save_rng_state(output_dir)
+
+            # Determine the new best metric / best model checkpoint
+            if metrics is not None and self.args.metric_for_best_model is not None:
+                metric_to_check = self.args.metric_for_best_model
+                if not metric_to_check.startswith("eval_"):
+                    metric_to_check = f"eval_{metric_to_check}"
+                try:
+                    metric_value = metrics[metric_to_check]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"The `metric_for_best_model` training argument is set to '{metric_to_check}', which is not found in the evaluation metrics. "
+                        f"The available evaluation metrics are: {list(metrics.keys())}. Consider changing the `metric_for_best_model` via the TrainingArguments."
+                    ) from exc
+
+                operator = np.greater if self.args.greater_is_better else np.less
+                if (
+                    self.state.best_metric is None
+                    or self.state.best_model_checkpoint is None
+                    or operator(metric_value, self.state.best_metric)
+                ):
+                    self.state.best_metric = metric_value
+                    self.state.best_model_checkpoint = output_dir
+
+            # Save the Trainer state
+            if self.args.should_save:
+                # Update the `TrainerControl` state to where we are currently
+                self.state.stateful_callbacks["TrainerControl"] = self.control.state()
+                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            if self.args.push_to_hub:
+                self._push_from_checkpoint(output_dir)
+
+            # Maybe delete some older checkpoints.
+            if self.args.should_save:
+                # Solely rely on numerical checkpoint id for rotation.
+                # mtime is not reliable especially on some fuse fs in cloud environments.
+                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+                
+        elif getattr(self.args, "training_recipe") == "task_embed":
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            from transformers.trainer import TRAINER_STATE_NAME
+            # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+            # want to save except FullyShardedDDP.
+            # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+            # Save model checkpoint
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+            if self.hp_search_backend is None and trial is None:
+                self.store_flos()
+
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            # Only save embedding ==============
+            keys_to_match = ['task_embed']
+            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+
+            if self.args.local_rank == 0 or self.args.local_rank == -1:
+                self.model.config.save_pretrained(output_dir)
+                torch.save(weight_to_save, os.path.join(output_dir, f'task_embed.bin'))
+            # self.save_model(output_dir, _internal_call=True)
+            #===================================
+
+            if not self.args.save_only_model:
+                # Save optimizer and scheduler
+                self._save_optimizer_and_scheduler(output_dir)
+                # Save RNG state
+                self._save_rng_state(output_dir)
+
+            # Determine the new best metric / best model checkpoint
+            if metrics is not None and self.args.metric_for_best_model is not None:
+                metric_to_check = self.args.metric_for_best_model
+                if not metric_to_check.startswith("eval_"):
+                    metric_to_check = f"eval_{metric_to_check}"
+                try:
+                    metric_value = metrics[metric_to_check]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"The `metric_for_best_model` training argument is set to '{metric_to_check}', which is not found in the evaluation metrics. "
+                        f"The available evaluation metrics are: {list(metrics.keys())}. Consider changing the `metric_for_best_model` via the TrainingArguments."
+                    ) from exc
+
+                operator = np.greater if self.args.greater_is_better else np.less
+                if (
+                    self.state.best_metric is None
+                    or self.state.best_model_checkpoint is None
+                    or operator(metric_value, self.state.best_metric)
+                ):
+                    self.state.best_metric = metric_value
+                    self.state.best_model_checkpoint = output_dir
+
+            # Save the Trainer state
+            if self.args.should_save:
+                # Update the `TrainerControl` state to where we are currently
+                self.state.stateful_callbacks["TrainerControl"] = self.control.state()
+                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            if self.args.push_to_hub:
+                self._push_from_checkpoint(output_dir)
+
+            # Maybe delete some older checkpoints.
+            if self.args.should_save:
+                # Solely rely on numerical checkpoint id for rotation.
+                # mtime is not reliable especially on some fuse fs in cloud environments.
+                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+        elif getattr(self.args, "training_recipe") == "partial":
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            from transformers.trainer import TRAINER_STATE_NAME
+            # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+            # want to save except FullyShardedDDP.
+            # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+            # Save model checkpoint
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+            if self.hp_search_backend is None and trial is None:
+                self.store_flos()
+
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            # Only save Adapter ==============
+            keys_to_match = []
+            for name,param in self.model.named_parameters():
+                if param.requires_grad:
+                    keys_to_match.append(name)
+
+            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+
+            if self.args.local_rank == 0 or self.args.local_rank == -1:
+                self.model.config.save_pretrained(output_dir)
+                torch.save(weight_to_save, os.path.join(output_dir, f'trainables.bin'))
+            # self.save_model(output_dir, _internal_call=True)
+            #===================================
+
+            if not self.args.save_only_model:
+                # Save optimizer and scheduler
+                self._save_optimizer_and_scheduler(output_dir)
+                # Save RNG state
+                self._save_rng_state(output_dir)
+
+            # Determine the new best metric / best model checkpoint
+            if metrics is not None and self.args.metric_for_best_model is not None:
+                metric_to_check = self.args.metric_for_best_model
+                if not metric_to_check.startswith("eval_"):
+                    metric_to_check = f"eval_{metric_to_check}"
+                try:
+                    metric_value = metrics[metric_to_check]
+                except KeyError as exc:
+                    raise KeyError(
+                        f"The `metric_for_best_model` training argument is set to '{metric_to_check}', which is not found in the evaluation metrics. "
+                        f"The available evaluation metrics are: {list(metrics.keys())}. Consider changing the `metric_for_best_model` via the TrainingArguments."
+                    ) from exc
+
+                operator = np.greater if self.args.greater_is_better else np.less
+                if (
+                    self.state.best_metric is None
+                    or self.state.best_model_checkpoint is None
+                    or operator(metric_value, self.state.best_metric)
+                ):
+                    self.state.best_metric = metric_value
+                    self.state.best_model_checkpoint = output_dir
+
+            # Save the Trainer state
+            if self.args.should_save:
+                # Update the `TrainerControl` state to where we are currently
+                self.state.stateful_callbacks["TrainerControl"] = self.control.state()
+                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            if self.args.push_to_hub:
+                self._push_from_checkpoint(output_dir)
+
+            # Maybe delete some older checkpoints.
+            if self.args.should_save:
+                # Solely rely on numerical checkpoint id for rotation.
+                # mtime is not reliable especially on some fuse fs in cloud environments.
+                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+
+        else:
+            super(ProjTrainer, self)._save_checkpoint(model, trial, metrics)
+    
 
 def project_to_mean(tensor, mean):
     # tensor: A x B, mean: A x B
     # Calculate the squared Frobenius norm of M
+    shape = tensor.shape
     m_squared_norm = torch.sum(mean ** 2)
     
     # Handle the case where M is a zero tensor to avoid division by zero
@@ -857,11 +1146,11 @@ def project_to_mean(tensor, mean):
         return torch.zeros_like(tensor)
     
     # Compute the Frobenius inner product between each tensor and M
-    inner_products = torch.sum(tensor * mean, dim=(0, 1))
+    inner_products = torch.sum(tensor * mean)
     # Calculate projection coefficients
     coefficients = inner_products / m_squared_norm
     # Reshape coefficients for broadcasting
-    coefficients = coefficients.view(1, 1)
+    # coefficients = coefficients.view(1, 1)
     # Project all tensors onto the mean direction
     projected = coefficients * mean
     

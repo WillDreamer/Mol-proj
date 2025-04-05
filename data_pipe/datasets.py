@@ -65,7 +65,7 @@ class MetaGraphDataset(Dataset):
             self.filter_for_training()
             logger.info(f"Filtered {self.__len__()} for training", on_rank0=True)
         
-    def selfies2smiles(self, selfies_str: str) -> str | None:
+    def selfies2smiles(self, selfies_str: str) -> str:
         try:
             smiles_str = selfies.decoder(selfies_str)
         except:

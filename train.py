@@ -14,6 +14,7 @@ from helpers import model_profiler, seperate_save_lora, seperate_save_partial
 import model_factory
 import pathlib
 import wandb
+from grad_proj.proj_trainer import ProjTrainer
 
 logger = WrappedLogger(__name__)
 
@@ -78,7 +79,7 @@ def main(model_args: ModelArguments, data_args: DataArguments, training_args: Tr
                     return {"should_training_stop": True}
     
     # train
-    trainer = train_engine.MoETrainer(
+    trainer = ProjTrainer(
         model=model,
         args=training_args,
         callbacks=[SaveCallback(), TruncateCallback()],

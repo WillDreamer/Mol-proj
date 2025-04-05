@@ -41,6 +41,7 @@ class MoECausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     moe_loss_list: Optional[Tuple[torch.FloatTensor]] = None
     attention_mask: Optional[torch.Tensor] = None
+    this_task_ids: Optional[torch.Tensor] = None
 
 
 class LlavaPreTrainedModel(PreTrainedModel):
@@ -560,14 +561,15 @@ class GraphLlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
+                loss_fct = CrossEntropyLoss(reduction="none")
                 shift_logits = shift_logits.view(-1, self.vocab_size)
                 shift_labels = shift_labels.view(-1)
                 # Enable model/pipeline parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels, reduce=(not return_raw_loss))
+                loss = loss_fct(shift_logits, shift_labels)  # False
                 
-            model_loss = loss.item()
+                
+            model_loss = loss.mean().item()
             
             if self.config.moe_enable:
                 if len(outputs[-1]) > 0 and isinstance(outputs[-1], list):
